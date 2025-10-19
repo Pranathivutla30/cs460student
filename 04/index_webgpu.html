@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>CS460 – A04 Flashy Fish (WebGPU)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { height:100%; margin:0; overflow:hidden; background:#0b3f63; }
+    #bg, #gpu { position: fixed; inset: 0; display:block; width:100vw; height:100vh; }
+    #bg  { z-index: 0; }  /* 2D waves + sea plants + pebbles */
+    #gpu { z-index: 1; }  /* WebGPU fish */
+    .ui {
+      position: fixed; left: 10px; bottom: 10px; z-index: 2;
+      display:flex; gap:.5rem; align-items:center; flex-wrap:wrap;
+      font:12px/1.2 monospace; color:#e8f4ff; user-select:none;
+      background:rgba(0,0,0,.25); padding:.45rem .6rem; border-radius:.5rem;
+      box-shadow:0 .5rem 1rem rgba(0,0,0,.15);
+    }
+    .ui button { border:0; padding:.35rem .55rem; border-radius:.35rem; cursor:pointer; }
+    .err { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:#fff; font:16px system-ui, sans-serif; background:#102535; }
+  </style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="gpu"></canvas>
+
+<div class="ui">
+  <button id="musicBtn">▶ Play Music</button>
+  <span>← → ↑ ↓ move big · A/D rotate · +/- speed · Space pause · F wireframe · Click adds fish · R reset</span>
+</div>
+
+<div id="wgpuErr" class="err" style="display:none">
+  WebGPU not supported in this browser. Try a recent Chrome/Edge, or enable “Unsafe WebGPU” in chrome://flags.
+</div>
+
+<!-- ==================== SHADERS (WGSL) ==================== -->
+<script id="fishVert" type="x-shader/x-vertex">
+struct GlobalTime {
+  t   : f32,
+  _pad: vec3<f32>,
+};
+@group(0) @binding(0) var<uniform> U : GlobalTime;
+
+struct VSOut {
+  @builtin(position) pos : vec4f,
+  @location(0) localPos  : vec2f,
+  @location(1) color     : vec4f,
+};
+
+@vertex
+fn main(
+  @location(0) position : vec2f, // mesh xy
+  @location(1) inst0 : vec4f,    // tx,ty,angle,scale
+  @location(2) inst1 : vec4f,    // dir,r,g,b
+  @location(3) inst2 : vec4f     // a,seed,baseAlpha,_
+) -> VSOut {
+  let tx    = inst0.x;
+  let ty    = inst0.y;
+  let angle = inst0.z;
+  let scale = inst0.w;
+
+  let dir   = inst1.x;
+  let rgb   = inst1.yzw;
+
+  let seed      = inst2.y;
+  let baseAlpha = inst2.z;
+
+  let c  = cos(angle);
+  let s  = sin(angle);
+  let sx = scale * dir;
+  let sy = scale;
+
+  let x = position.x;
+  let y = position.y;
+  let mx = sx * (c * x - s * y);
+  let my = sy * (s * x + c * y);
+  let wx = mx + tx;
+  let wy = my + ty;
+
+  let pulse   = 0.15 * sin(U.t * 2.0 + seed * 0.0013);
+  let shimmer = 0.12 * abs(sin(U.t * 18.0 + seed));
+  let A = clamp(baseAlpha + pulse + shimmer, 0.35, 1.0);
+
+  var out : VSOut;
+  out.pos      = vec4f(wx, wy, 0.0, 1.0);
+  out.localPos = vec2f(x, y);
+  out.color    = vec4f(rgb, A);
+  return out;
+}
+</script>
+
+<script id="fishFrag" type="x-shader/x-fragment">
+@fragment
+fn main(@location(1) color: vec4f) -> @location(0) vec4f { return color; }
+</script>
+
+<script id="eyeVert" type="x-shader/x-vertex">
+struct GlobalTime {
+  t   : f32,
+  _pad: vec3<f32>,
+};
+@group(0) @binding(0) var<uniform> U : GlobalTime;
+
+struct VSOut {
+  @builtin(position) pos : vec4f,
+  @location(0) eyeLocal  : vec2f,
+  @location(1) color     : vec4f,
+};
+
+@vertex
+fn main(
+  @location(0) position : vec2f, // quad [-1..1]^2
+  @location(1) inst0 : vec4f,    // tx,ty,angle,scale
+  @location(2) inst1 : vec4f,    // dir,r,g,b
+  @location(3) inst2 : vec4f     // a,seed,baseAlpha,_
+) -> VSOut {
+  let tx    = inst0.x;
+  let ty    = inst0.y;
+  let angle = inst0.z;
+  let scale = inst0.w;
+
+  let dir = inst1.x;
+
+  let eyeCenter = vec2f(0.20, 0.20);
+
+  let c  = cos(angle);
+  let s  = sin(angle);
+  let sx = scale * dir;
+  let sy = scale;
+
+  let ex = sx * (c * eyeCenter.x - s * eyeCenter.y) + tx;
+  let ey = sy * (s * eyeCenter.x + c * eyeCenter.y) + ty;
+
+  let px = position.x * (0.03 * scale);
+  let py = position.y * (0.03 * scale);
+
+  var out : VSOut;
+  out.pos      = vec4f(ex + px, ey + py, 0.0, 1.0);
+  out.eyeLocal = position;
+  out.color    = vec4f(0.0, 0.0, 0.0, 0.85);
+  return out;
+}
+</script>
+
+<script id="eyeFrag" type="x-shader/x-fragment">
+@fragment
+fn main(@location(0) eyeLocal: vec2f, @location(1) color: vec4f) -> @location(0) vec4f {
+  if (length(eyeLocal) > 1.0) { discard; }
+  return color;
+}
+</script>
+
+<script id="lineFrag" type="x-shader/x-fragment">
+@fragment
+fn main() -> @location(0) vec4f { return vec4f(0.0,0.0,0.0,0.35); }
+</script>
+
+<script>
+/* =========================
+   2D BACKGROUND (with fixes)
+   ========================= */
+(function(){
+  const bg = document.getElementById('bg');
+  const ctx = bg.getContext('2d');
+  const DPR = Math.max(1, devicePixelRatio || 1);
+  const sandTop = 0.78;
+  const greens = ['#6bd097','#5ec18b','#4fb17e','#7fe0b0'];
+  const stems  = ['#3f8b6a','#377b5d','#2f6b50'];
+  const plants = [], pebbles = [], foam = [];
+  const rnd=(a,b)=>a+Math.random()*(b-a);
+
+  function resize(){
+    bg.width  = innerWidth * DPR;
+    bg.height = innerHeight * DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    plants.length=0; pebbles.length=0; foam.length=0;
+    const sandY = innerHeight*sandTop;
+
+    const pebbleColors=['#a8a5a1','#8f8c88','#b0ada7','#9c9388','#88827b'];
+    for(let i=0;i<60;i++){
+      pebbles.push({ x:rnd(12,innerWidth-12), y:rnd(sandY+8,innerHeight-4), r:rnd(4,12), k:rnd(0.6,1.0),
+        color:pebbleColors[i%pebbleColors.length], rot:rnd(-0.9,0.9) });
+    }
+    for(let i=0;i<22;i++){
+      const x=rnd(20,innerWidth-20), h=rnd(80,160), baseY=sandY+4, blades=[];
+      const n=3+Math.floor(Math.random()*3);
+      for(let b=0;b<n;b++) blades.push({ width:rnd(6,12), height:h*rnd(0.8,1.1), color:greens[(i+b)%greens.length], offset:rnd(-14,14) });
+      plants.push({ x, baseY, h, blades, phase:rnd(0,Math.PI*2), sway:rnd(0.12,0.22) });
+    }
+    for(let i=0;i<80;i++) foam.push({ x:rnd(0,innerWidth), y:rnd(0,innerHeight*0.18), r:rnd(0.8,2.2), speed:rnd(8,20) });
+  }
+
+  function drawPebble(p){
+    ctx.save();
+    ctx.translate(p.x,p.y);
+    ctx.rotate(p.rot);
+    ctx.scale(1,p.k);
+    ctx.shadowColor='rgba(0,0,0,.22)';
+    ctx.shadowBlur=6;
+    ctx.shadowOffsetY=3;
+    ctx.fillStyle=p.color;
+    ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+    // reset shadows so future strokes don’t inherit
+    ctx.shadowColor='transparent'; ctx.shadowBlur=0; ctx.shadowOffsetX=0; ctx.shadowOffsetY=0;
+  }
+
+  function drawBlade(x, baseY, H, width, t, color, phase, swayAmp){
+    const sway=Math.sin(t*1.2+phase)*swayAmp*H, topX=x+sway, midX=x+sway*0.55;
+    ctx.fillStyle=color; ctx.beginPath();
+    ctx.moveTo(x - width*0.5, baseY);
+    ctx.bezierCurveTo(x-width*0.5,baseY-H*0.35, midX-width*0.4,baseY-H*0.7, topX,baseY-H);
+    ctx.bezierCurveTo(midX+width*0.4,baseY-H*0.7, x+width*0.5,baseY-H*0.35, x+width*0.5,baseY);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function drawPlants(t){
+    ctx.save();
+    ctx.lineJoin='round'; ctx.lineCap='round'; ctx.shadowColor='transparent'; ctx.shadowBlur=0;
+    for(const p of plants){
+      ctx.lineWidth=Math.max(3,p.h*0.06);
+      ctx.strokeStyle=stems[((p.x|0)+p.blades.length)%stems.length];
+      ctx.beginPath(); ctx.moveTo(p.x,p.baseY);
+      const sway=Math.sin(t*1.2+p.phase)*p.sway*p.h;
+      ctx.bezierCurveTo(p.x+sway*0.4,p.baseY-p.h*0.35, p.x+sway*0.7,p.baseY-p.h*0.7, p.x+sway,p.baseY-p.h);
+      ctx.stroke();
+      for(const b of p.blades) drawBlade(p.x+b.offset*0.3,p.baseY,b.height,b.width,t,b.color,p.phase+b.offset*0.05,p.sway);
+    }
+    ctx.restore();
+  }
+
+  function drawWaves(t){
+    ctx.save();
+    ctx.globalCompositeOperation='source-over';
+    ctx.shadowColor='transparent'; ctx.shadowBlur=0;
+    ctx.lineJoin='round'; ctx.lineCap='round';
+
+    const W=innerWidth,H=innerHeight;
+    const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#0f4e79'); g.addColorStop(1,'#0a3555');
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+    const bands=[ {yFrac:0.14,amp:18,freq:0.010,speed:30,color:'rgba(255,255,255,0.08)'},
+                  {yFrac:0.18,amp:26,freq:0.008,speed:20,color:'rgba(255,255,255,0.06)'},
+                  {yFrac:0.22,amp:34,freq:0.006,speed:12,color:'rgba(255,255,255,0.05)'} ];
+    ctx.lineWidth=3;
+    for(const b of bands){
+      const y0=H*b.yFrac; ctx.beginPath();
+      for(let x=0;x<=W;x+=6){ const y=y0+Math.sin((x+t*b.speed)*b.freq)*b.amp; if(x===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+      ctx.strokeStyle=b.color; ctx.stroke();
+    }
+
+    ctx.fillStyle='rgba(255,255,255,0.18)';
+    for(const f of foam){
+      f.x+=f.speed*(1/60); if(f.x>W+10)f.x=-10;
+      const y=H*0.14+Math.sin((f.x+t*40)*0.01)*10+(f.y*0.1);
+      ctx.beginPath(); ctx.arc(f.x,y,f.r,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawSand(){
+    const W=innerWidth,H=innerHeight,sandY=H*sandTop;
+    const sg=ctx.createLinearGradient(0,sandY,0,H); sg.addColorStop(0,'#c7b48a'); sg.addColorStop(1,'#b79d6a');
+    ctx.fillStyle=sg; ctx.fillRect(0,sandY,W,H-sandY);
+    for(const p of pebbles) drawPebble(p);
+  }
+
+  function frame(ts){
+    const t = ts*0.001;
+    // DPR-aware full clear (prevents side artifacts)
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,bg.width,bg.height);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+
+    drawWaves(t);
+    drawSand();
+    drawPlants(t);
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+
+<script>
+/* =================
+   WEBGPU FISH RENDER
+   ================= */
+(async () => {
+  const err = document.getElementById('wgpuErr');
+  if (!('gpu' in navigator)) { err.style.display='flex'; return; }
+
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { err.style.display='flex'; return; }
+  const device = await adapter.requestDevice();
+  const canvas = document.getElementById('gpu');
+  const ctx = canvas.getContext('webgpu');
+
+  const format = navigator.gpu.getPreferredCanvasFormat();
+  function fit() {
+    const DPR = devicePixelRatio || 1;
+    canvas.width  = Math.floor(innerWidth  * DPR);
+    canvas.height = Math.floor(innerHeight * DPR);
+    ctx.configure({ device, format, alphaMode:'premultiplied' });
+  }
+  addEventListener('resize', fit); fit();
+
+  // ---------- geometry ----------
+  const fishVerts = new Float32Array([
+     0.50,  0.00,  0.20,  0.25,  -0.20,  0.15,
+    -0.40,  0.30, -0.40, -0.30,  -0.20, -0.15,
+     0.20, -0.25
+  ]);
+  const fishIdx = new Uint16Array([ 0,1,6, 1,2,6, 2,5,6, 2,3,5, 3,4,5 ]);
+  const edgeIdx = new Uint16Array([ 0,1, 1,2, 2,3, 3,4, 4,5, 5,6, 6,0, 2,5 ]);
+
+  function makeBuffer(arr, usage) {
+    const buf = device.createBuffer({ size: ((arr.byteLength+3)>>2)<<2, usage, mappedAtCreation: true });
+    new (arr.constructor)(buf.getMappedRange()).set(arr);
+    buf.unmap();
+    return buf;
+  }
+  const fishVB = makeBuffer(fishVerts, GPUBufferUsage.VERTEX);
+  const fishIB = makeBuffer(fishIdx,   GPUBufferUsage.INDEX);
+  const edgeIB = makeBuffer(edgeIdx,   GPUBufferUsage.INDEX);
+
+  // eye quad (strip)
+  const eyeQuad = new Float32Array([ -1,-1, 1,-1, -1,1, 1,1 ]);
+  const eyeVB   = makeBuffer(eyeQuad, GPUBufferUsage.VERTEX);
+
+  // ---------- per-instance data via THREE buffers ----------
+  // inst0 = (tx,ty,angle,scale)
+  // inst1 = (dir,r,g,b)
+  // inst2 = (a,seed,baseAlpha,_)
+  const MAX = 512;
+  const inst0Buf = device.createBuffer({ size: MAX * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  const inst1Buf = device.createBuffer({ size: MAX * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  const inst2Buf = device.createBuffer({ size: MAX * 16, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+
+  // ---- time uniform buffer (padded to 256 bytes for safety) ----
+  const timeUBO = device.createBuffer({
+    size: 256,  // WebGPU spec requires at least 256-byte alignment on some GPUs
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  });
+
+  const bindLayout = device.createBindGroupLayout({
+    entries:[{ binding:0, visibility:GPUShaderStage.VERTEX, buffer:{type:'uniform'} }]
+  });
+  const bindGroup  = device.createBindGroup({
+    layout: bindLayout,
+    entries:[{ binding:0, resource:{ buffer: timeUBO } }]
+  });
+
+  // ---------- pipelines ----------
+  const fishPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts:[bindLayout] }),
+    vertex: {
+      module: device.createShaderModule({ code: document.getElementById('fishVert').textContent }),
+      entryPoint: 'main',
+      buffers: [
+        { arrayStride: 2*4, attributes: [{ shaderLocation:0, offset:0, format:'float32x2' }] },           // mesh
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:1, offset:0, format:'float32x4' }] }, // inst0
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:2, offset:0, format:'float32x4' }] }, // inst1
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:3, offset:0, format:'float32x4' }] }, // inst2
+      ],
+    },
+    fragment: {
+      module: device.createShaderModule({ code: document.getElementById('fishFrag').textContent }),
+      entryPoint: 'main',
+      targets: [{
+        format,
+        blend: {
+          color: { srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha', operation:'add' },
+          alpha: { srcFactor:'one', dstFactor:'one-minus-src-alpha', operation:'add' },
+        }
+      }]
+    },
+    primitive: { topology:'triangle-list', cullMode:'none' }
+  });
+
+  const eyePipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts:[bindLayout] }),
+    vertex: {
+      module: device.createShaderModule({ code: document.getElementById('eyeVert').textContent }),
+      entryPoint: 'main',
+      buffers: [
+        { arrayStride: 2*4, attributes: [{ shaderLocation:0, offset:0, format:'float32x2' }] },            // quad
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:1, offset:0, format:'float32x4' }] }, // inst0
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:2, offset:0, format:'float32x4' }] }, // inst1
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:3, offset:0, format:'float32x4' }] }, // inst2
+      ],
+    },
+    fragment: {
+      module: device.createShaderModule({ code: document.getElementById('eyeFrag').textContent }),
+      entryPoint: 'main',
+      targets: [{
+        format,
+        blend: {
+          color: { srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha', operation:'add' },
+          alpha: { srcFactor:'one', dstFactor:'one-minus-src-alpha', operation:'add' },
+        }
+      }]
+    },
+    primitive: { topology:'triangle-strip', cullMode:'none' }
+  });
+
+  const linePipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts:[bindLayout] }),
+    vertex: {
+      module: device.createShaderModule({ code: document.getElementById('fishVert').textContent }),
+      entryPoint:'main',
+      buffers: [
+        { arrayStride: 2*4, attributes: [{ shaderLocation:0, offset:0, format:'float32x2' }] },            // mesh
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:1, offset:0, format:'float32x4' }] }, // inst0
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:2, offset:0, format:'float32x4' }] }, // inst1
+        { arrayStride: 16,  stepMode:'instance', attributes: [{ shaderLocation:3, offset:0, format:'float32x4' }] }, // inst2
+      ],
+    },
+    fragment: {
+      module: device.createShaderModule({ code: document.getElementById('lineFrag').textContent }),
+      entryPoint:'main',
+      targets: [{
+        format,
+        blend: {
+          color: { srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha', operation:'add' },
+          alpha: { srcFactor:'one', dstFactor:'one-minus-src-alpha', operation:'add' },
+        }
+      }]
+    },
+    primitive: { topology:'line-list', cullMode:'none' }
+  });
+
+  // ---------- scene ----------
+  const palette = [
+    [0.96,0.35,0.38],[0.29,0.70,1.00],[0.31,0.88,0.62],[1.00,0.84,0.33],[0.85,0.60,1.00],
+    [1.00,0.55,0.75],[0.35,0.95,0.90],[1.00,0.66,0.31],[0.65,0.85,0.25],[0.90,0.40,0.90]
+  ];
+  const rnd=(a,b)=>a+Math.random()*(b-a);
+  const fish=[];
+  function createFish({color,offset=[0,0],scale=1,direction=1,speed=0.008,angle=0}={}){
+    let rgb=color;
+    if(!rgb){
+      const base=palette[(Math.random()*palette.length)|0];
+      rgb=[ Math.min(1,Math.max(0,base[0]+rnd(-0.06,0.06))),
+            Math.min(1,Math.max(0,base[1]+rnd(-0.06,0.06))),
+            Math.min(1,Math.max(0,base[2]+rnd(-0.06,0.06))) ];
+    }
+    const baseAlpha=rnd(0.55,0.85);
+    return { tx:offset[0], ty:offset[1], angle, scale, dir:direction, r:rgb[0], g:rgb[1], b:rgb[2], a:baseAlpha, seed:Math.random()*1000, speed };
+  }
+  function resetScene(){
+    fish.length=0;
+    fish.push(createFish({ color:[1,0,0], offset:[-0.7,0], scale:1.0, direction:-1, speed:0.010 }));
+    for(let i=0;i<100;i++){
+      fish.push(createFish({ offset:[rnd(-0.9,0.9), rnd(-0.85,0.85)], scale:rnd(0.12,0.25), direction:Math.random()<0.5?-1:1, speed:rnd(0.006,0.012), angle:rnd(-0.12,0.12) }));
+    }
+  }
+  resetScene();
+
+  // write per-instance buffers
+  function syncInstances(){
+    const n = fish.length;
+    const inst0 = new Float32Array(n*4);
+    const inst1 = new Float32Array(n*4);
+    const inst2 = new Float32Array(n*4);
+    let i0=0,i1=0,i2=0;
+    for(const f of fish){
+      inst0[i0++]=f.tx;  inst0[i0++]=f.ty;   inst0[i0++]=f.angle; inst0[i0++]=f.scale;
+      inst1[i1++]=f.dir; inst1[i1++]=f.r;    inst1[i1++]=f.g;     inst1[i1++]=f.b;
+      inst2[i2++]=f.a;   inst2[i2++]=f.seed; inst2[i2++]=f.a;     inst2[i2++]=0;
+    }
+    device.queue.writeBuffer(inst0Buf,0,inst0.buffer,inst0.byteOffset,inst0.byteLength);
+    device.queue.writeBuffer(inst1Buf,0,inst1.buffer,inst1.byteOffset,inst1.byteLength);
+    device.queue.writeBuffer(inst2Buf,0,inst2.buffer,inst2.byteOffset,inst2.byteLength);
+  }
+  syncInstances();
+
+  // controls
+  let paused=false; window.__wireframeOn=false;
+  addEventListener('keydown',(e)=>{
+    if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+    if (e.key.toLowerCase()==='f') window.__wireframeOn=!window.__wireframeOn;
+    if (e.key.toLowerCase()==='r'){ resetScene(); syncInstances(); }
+    if (e.key===' ') paused=!paused;
+    const big=fish[0]; if(!big) return;
+    const accel=0.015;
+    if (e.key==='ArrowLeft'){  big.tx-=accel; big.dir=-1; syncInstances(); }
+    if (e.key==='ArrowRight'){ big.tx+=accel; big.dir=+1; syncInstances(); }
+    if (e.key==='ArrowUp'){    big.ty+=accel; syncInstances(); }
+    if (e.key==='ArrowDown'){  big.ty-=accel; syncInstances(); }
+    if (e.key==='a'||e.key==='A'){ big.angle-=0.03; syncInstances(); }
+    if (e.key==='d'||e.key==='D'){ big.angle+=0.03; syncInstances(); }
+    if (e.key==='+'||e.key==='='){ big.speed=Math.min(0.03,big.speed+0.0005); }
+    if (e.key==='-'||e.key==='_'){ big.speed=Math.max(0.002,big.speed-0.0005); }
+  });
+  canvas.addEventListener('pointerdown',(e)=>{
+    const r=canvas.getBoundingClientRect();
+    const x=((e.clientX-r.left)/r.width)*2-1;
+    const y=-(((e.clientY-r.top)/r.height)*2-1);
+    fish.push(createFish({ offset:[x,y], scale:rnd(0.12,0.22), direction:Math.random()<0.5?-1:1, speed:rnd(0.006,0.014) }));
+    syncInstances();
+  });
+
+  // music: file-first, WebAudio fallback
+  const musicBtn=document.getElementById('musicBtn');
+  let playing=false, htmlAudio=null, audioCtx=null, noiseNode=null, gainNode=null, lfo=null;
+  async function startAudioHtml(){ try{
+      if(!htmlAudio){ htmlAudio=new Audio('ocean.mp3'); htmlAudio.loop=true; htmlAudio.volume=0.45; }
+      await htmlAudio.play(); playing=true; musicBtn.textContent='⏸ Pause'; return true;
+    }catch(e){ return false; } }
+  function startAudioWeb(){
+    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended') audioCtx.resume();
+    const N=2*audioCtx.sampleRate, buf=audioCtx.createBuffer(1,N,audioCtx.sampleRate), ch=buf.getChannelData(0);
+    for(let i=0;i<N;i++) ch[i]=(Math.random()*2-1)*0.3;
+    noiseNode=audioCtx.createBufferSource(); noiseNode.buffer=buf; noiseNode.loop=true;
+    const lowpass=audioCtx.createBiquadFilter(); lowpass.type='lowpass'; lowpass.frequency.value=420;
+    gainNode=audioCtx.createGain(); gainNode.gain.value=0.25;
+    lfo=audioCtx.createOscillator(); const lfoGain=audioCtx.createGain(); lfo.frequency.value=0.10; lfoGain.gain.value=0.15;
+    lfo.connect(lfoGain).connect(gainNode.gain);
+    noiseNode.connect(lowpass).connect(gainNode).connect(audioCtx.destination);
+    noiseNode.start(); lfo.start(); playing=true; musicBtn.textContent='⏸ Pause';
+  }
+  function pauseAudio(){ if(htmlAudio && !htmlAudio.paused) htmlAudio.pause(); if(audioCtx && audioCtx.state==='running') audioCtx.suspend();
+    playing=false; musicBtn.textContent='▶ Play Music'; }
+  musicBtn.addEventListener('click', async ()=>{ if(!playing){ const ok=await startAudioHtml(); if(!ok) startAudioWeb(); } else { pauseAudio(); } });
+
+  // animation
+  const X_LIMIT=1.06;
+  function step(){
+    if (paused) return;
+    const now=performance.now();
+    for(let i=0;i<fish.length;i++){
+      const f=fish[i];
+      if(i!==0){ f.ty+=Math.sin(now*0.002 + i)*0.002; f.angle+=Math.sin(now*0.0012 + i*0.35)*0.001; }
+      f.tx += f.speed * (f.dir===-1?-1:1);
+      if (f.tx >  X_LIMIT) f.dir=-1;
+      if (f.tx < -X_LIMIT) f.dir=+1;
+      f.ty=Math.max(-0.98,Math.min(0.98,f.ty));
+    }
+    syncInstances();
+  }
+
+  // render loop
+  function frame(now){
+    step();
+
+    // write 16 bytes to UBO (t, pad, pad, pad)
+    const u = new Float32Array([now*0.001, 0, 0, 0]);
+    device.queue.writeBuffer(timeUBO, 0, u.buffer, u.byteOffset, u.byteLength);
+
+    const encoder=device.createCommandEncoder();
+    const pass=encoder.beginRenderPass({
+      colorAttachments:[{ view: ctx.getCurrentTexture().createView(), loadOp:'clear', storeOp:'store', clearValue:{r:0,g:0,b:0,a:0} }]
+    });
+
+    // fish body
+    pass.setPipeline(fishPipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.setVertexBuffer(0, fishVB);
+    pass.setVertexBuffer(1, inst0Buf);
+    pass.setVertexBuffer(2, inst1Buf);
+    pass.setVertexBuffer(3, inst2Buf);
+    pass.setIndexBuffer(fishIB,'uint16');
+    pass.drawIndexed(fishIdx.length, fish.length);
+
+    // optional wireframe
+    if (window.__wireframeOn){
+      pass.setPipeline(linePipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.setVertexBuffer(0, fishVB);
+      pass.setVertexBuffer(1, inst0Buf);
+      pass.setVertexBuffer(2, inst1Buf);
+      pass.setVertexBuffer(3, inst2Buf);
+      pass.setIndexBuffer(edgeIB,'uint16');
+      pass.drawIndexed(edgeIdx.length, fish.length);
+    }
+
+    // eyes
+    pass.setPipeline(eyePipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.setVertexBuffer(0, eyeVB);
+    pass.setVertexBuffer(1, inst0Buf);
+    pass.setVertexBuffer(2, inst1Buf);
+    pass.setVertexBuffer(3, inst2Buf);
+    pass.draw(4, fish.length);
+
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

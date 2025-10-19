@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>CS460 – A04 Flashy Fish</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { height:100%; margin:0; overflow:hidden; background:#0b3f63; }
+    #bg, #gl { position: fixed; inset: 0; display:block; width:100vw; height:100vh; }
+    #bg { z-index: 0; }   /* 2D waves + sea plants */
+    #gl { z-index: 1; }   /* WebGL fish */
+    .ui {
+      position: fixed; left: 10px; bottom: 10px; z-index: 2;
+      display:flex; gap:.5rem; align-items:center; flex-wrap:wrap;
+      font:12px/1.2 monospace; color:#e8f4ff; user-select:none;
+      background:rgba(0,0,0,.25); padding:.45rem .6rem; border-radius:.5rem;
+      box-shadow:0 .5rem 1rem rgba(0,0,0,.15);
+    }
+    .ui button { border:0; padding:.35rem .55rem; border-radius:.35rem; cursor:pointer; }
+  </style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="gl"></canvas>
+
+<div class="ui">
+  <button id="musicBtn">▶ Play Music</button>
+  <span>← → ↑ ↓ move big · A/D rotate · +/- speed · Space pause · F wireframe · Click adds fish · R reset</span>
+</div>
+
+<!-- Vertex Shader -->
+<script id="vs" type="x-shader/x-vertex">
+attribute vec3 a_position;
+uniform vec4  u_color;
+uniform mat4  u_transform;
+uniform float u_pointsize;
+varying vec4 v_color;
+void main(){
+  gl_Position = u_transform * vec4(a_position, 1.0);
+  gl_PointSize = u_pointsize;   // used when drawing the eye (POINTS)
+  v_color = u_color;
+}
+</script>
+
+<!-- Fragment Shader -->
+<script id="fs" type="x-shader/x-fragment">
+precision mediump float;
+varying vec4 v_color;
+void main(){ gl_FragColor = v_color; }
+</script>
+
+<script>
+/* ===============================
+   2D BACKGROUND: WAVES + SEAWEED
+   =============================== */
+(function(){
+  const bg = document.getElementById('bg');
+  const ctx = bg.getContext('2d');
+  const DPR = Math.max(1, devicePixelRatio || 1);
+
+  const sandTop = 0.78; // fraction from top where sand begins
+  const greens = ['#6bd097','#5ec18b','#4fb17e','#7fe0b0'];
+  const stems  = ['#3f8b6a','#377b5d','#2f6b50'];
+
+  const plants = [];
+  const pebbles = [];
+  const foam = [];
+
+  function rnd(a,b){ return a + Math.random()*(b-a); }
+
+  function resize() {
+    bg.width  = innerWidth * DPR;
+    bg.height = innerHeight * DPR;
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+
+    plants.length = 0;
+    pebbles.length = 0;
+    foam.length = 0;
+
+    const sandY = innerHeight * sandTop;
+
+    const pebbleColors = ['#a8a5a1','#8f8c88','#b0ada7','#9c9388','#88827b'];
+    for (let i=0;i<60;i++){
+      pebbles.push({
+        x: rnd(12, innerWidth-12),
+        y: rnd(sandY+8, innerHeight-4),
+        r: rnd(4,12),
+        k: rnd(0.6,1.0),
+        color: pebbleColors[i%pebbleColors.length],
+        rot: rnd(-0.9,0.9)
+      });
+    }
+
+    // sea plants
+    for (let i=0;i<22;i++){
+      const x = rnd(20, innerWidth-20);
+      const h = rnd(80, 160);
+      const baseY = sandY + 4;
+      const blades = [];
+      const bladeCount = 3 + Math.floor(Math.random()*3);
+      for (let b=0;b<bladeCount;b++){
+        blades.push({
+          width: rnd(6, 12),
+          height: h * rnd(0.8, 1.1),
+          color: greens[(i+b)%greens.length],
+          offset: rnd(-14, 14)
+        });
+      }
+      plants.push({
+        x, baseY, h, blades,
+        phase: rnd(0, Math.PI*2),
+        sway: rnd(0.12, 0.22)
+      });
+    }
+
+    // foam flecks on waves
+    for (let i=0;i<80;i++){
+      foam.push({ x: rnd(0, innerWidth), y: rnd(0, innerHeight*0.18), r: rnd(0.8,2.2), speed: rnd(8,20) });
+    }
+  }
+
+  function drawPebble(p){
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.scale(1, p.k);
+    ctx.shadowColor = 'rgba(0,0,0,.22)';
+    ctx.shadowBlur = 6;
+    ctx.shadowOffsetY = 3;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(0,0,p.r,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // seaweed blade
+  function drawBlade(x, baseY, H, width, t, color, phase, swayAmp){
+    const sway = Math.sin(t*1.2 + phase) * swayAmp * H;
+    const topX = x + sway;
+    const midX = x + sway*0.55;
+
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x - width*0.5, baseY);
+    ctx.bezierCurveTo(
+      x - width*0.5, baseY - H*0.35,
+      midX - width*0.4, baseY - H*0.7,
+      topX, baseY - H
+    );
+    ctx.bezierCurveTo(
+      midX + width*0.4, baseY - H*0.7,
+      x + width*0.5, baseY - H*0.35,
+      x + width*0.5, baseY
+    );
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawPlants(t){
+    for (const p of plants){
+      // stem behind blades
+      ctx.lineCap = 'round';
+      ctx.lineWidth = Math.max(3, p.h*0.06);
+      ctx.strokeStyle = stems[((p.x|0)+p.blades.length)%stems.length];
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.baseY);
+      const sway = Math.sin(t*1.2 + p.phase) * p.sway * p.h;
+      ctx.bezierCurveTo(p.x + sway*0.4, p.baseY - p.h*0.35,
+                        p.x + sway*0.7, p.baseY - p.h*0.7,
+                        p.x + sway,     p.baseY - p.h);
+      ctx.stroke();
+
+      // front blades
+      for (const b of p.blades){
+        drawBlade(p.x + b.offset*0.3, p.baseY, b.height, b.width, t, b.color, p.phase + b.offset*0.05, p.sway);
+      }
+    }
+  }
+
+  function drawWaves(t){
+    const W = innerWidth, H = innerHeight;
+
+    // deep water gradient
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'#0f4e79');
+    g.addColorStop(1,'#0a3555');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+
+    // layered bands
+    const bands = [
+      { yFrac:0.14, amp:18,  freq:0.010, speed:30, color:'rgba(255,255,255,0.08)' },
+      { yFrac:0.18, amp:26,  freq:0.008, speed:20, color:'rgba(255,255,255,0.06)' },
+      { yFrac:0.22, amp:34,  freq:0.006, speed:12, color:'rgba(255,255,255,0.05)' }
+    ];
+    ctx.lineWidth = 3;
+
+    for (const b of bands){
+      const y0 = H*b.yFrac;
+      ctx.beginPath();
+      for (let x=0; x<=W; x+=6){
+        const y = y0 + Math.sin((x + t*b.speed)*b.freq) * b.amp;
+        if (x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle = b.color;
+      ctx.stroke();
+    }
+
+    // foam dots drifting right
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    for (const f of foam){
+      f.x += f.speed * (1/60);
+      if (f.x > W+10) f.x = -10;
+      const y = H*0.14 + Math.sin((f.x + t*40)*0.01)*10 + (f.y*0.1);
+      ctx.beginPath();
+      ctx.arc(f.x, y, f.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  function drawSand(){
+    const W = innerWidth, H = innerHeight;
+    const sandY = H*sandTop;
+    const sg = ctx.createLinearGradient(0,sandY,0,H);
+    sg.addColorStop(0,'#c7b48a');
+    sg.addColorStop(1,'#b79d6a');
+    ctx.fillStyle = sg;
+    ctx.fillRect(0, sandY, W, H-sandY);
+    for (const p of pebbles) drawPebble(p);
+  }
+
+  function frame(ts){
+    const t = ts*0.001;
+    ctx.clearRect(0,0,innerWidth,innerHeight);
+    drawWaves(t);
+    drawSand();
+    drawPlants(t);
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+
+/* ==========
+   WEBGL FISH
+   ========== */
+(() => {
+  const canvas = document.getElementById('gl');
+  const gl = canvas.getContext('webgl');
+  if(!gl){ alert('WebGL not supported'); return; }
+
+  function fit(){
+    const DPR = devicePixelRatio || 1;
+    canvas.width = innerWidth * DPR;
+    canvas.height = innerHeight * DPR;
+    gl.viewport(0,0,gl.drawingBufferWidth, gl.drawingBufferHeight);
+  }
+  addEventListener('resize', fit); fit();
+
+  // compile/link
+  function compile(src, type){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(s);
+    return s;
+  }
+  function makeProgram(vs, fs){
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(vs, gl.VERTEX_SHADER));
+    gl.attachShader(p, compile(fs, gl.FRAGMENT_SHADER));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+    return p;
+  }
+
+  const prog = makeProgram(
+    document.getElementById('vs').textContent,
+    document.getElementById('fs').textContent
+  );
+  gl.useProgram(prog);
+
+  const a_position  = gl.getAttribLocation(prog, 'a_position');
+  const u_color     = gl.getUniformLocation(prog, 'u_color');
+  const u_pointsize = gl.getUniformLocation(prog, 'u_pointsize');
+  const u_transform = gl.getUniformLocation(prog, 'u_transform');
+
+  // alpha blending
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.disable(gl.DEPTH_TEST);
+
+  // geometry (shared fish)
+  const verts = new Float32Array([
+    0.50,  0.00, 0.0,
+    0.20,  0.25, 0.0,
+   -0.20,  0.15, 0.0,
+   -0.40,  0.30, 0.0,
+   -0.40, -0.30, 0.0,
+   -0.20, -0.15, 0.0,
+    0.20, -0.25, 0.0
+  ]);
+  const tris = new Uint8Array([0,1,6, 1,2,6, 2,5,6, 2,3,5, 3,4,5]);
+  const edges = new Uint8Array([0,1,1,2,2,3,3,4,4,5,5,6,6,0,2,5]);
+
+  const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, tris, gl.STATIC_DRAW);
+  const ebo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, edges, gl.STATIC_DRAW);
+
+  function TRS(tx,ty,sx,sy,a){
+    const c=Math.cos(a), s=Math.sin(a);
+    return new Float32Array([
+      sx*c,  sy*s, 0,0,
+      -sx*s, sy*c, 0,0,
+      0,0,1,0,
+      tx,ty,0,1
+    ]);
+  }
+  const rnd=(a,b)=>a+Math.random()*(b-a);
+
+  // colorful palette
+  const palette = [
+    [0.96,0.35,0.38],[0.29,0.70,1.00],[0.31,0.88,0.62],[1.00,0.84,0.33],[0.85,0.60,1.00],
+    [1.00,0.55,0.75],[0.35,0.95,0.90],[1.00,0.66,0.31],[0.65,0.85,0.25],[0.90,0.40,0.90]
+  ];
+
+  function createFish({color, offset=[0,0,0], scale=1, direction=1, speed=0.008, angle=0}={}){
+    // eye buffer
+    const eyeV = new Float32Array([0.20,0.20,0.0]);
+    const eyeVBO = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, eyeVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, eyeV, gl.STATIC_DRAW);
+
+    // color (pick if not provided)
+    let rgb = color;
+    if (!rgb) {
+      const base = palette[(Math.random()*palette.length)|0];
+      rgb = [
+        Math.min(1, Math.max(0, base[0] + rnd(-0.06,0.06))),
+        Math.min(1, Math.max(0, base[1] + rnd(-0.06,0.06))),
+        Math.min(1, Math.max(0, base[2] + rnd(-0.06,0.06))),
+      ];
+    }
+    const rgba = new Float32Array([rgb[0], rgb[1], rgb[2], rnd(0.55,0.85)]);
+
+    return {
+      color: rgba,
+      offset: new Float32Array(offset),
+      scale, direction, speed, angle, eyeVBO,
+      seed: Math.random() * 1000   // for flicker
+    };
+  }
+
+  // scene
+  let fish = [];
+  function resetScene(){
+    fish = [];
+    fish.push(createFish({ color:[1,0,0], offset:[-0.7,0,0], scale:1.0, direction:-1, speed:0.010, angle:0 }));
+    for(let i=0;i<100;i++){
+      fish.push(createFish({
+        offset:[rnd(-0.9,0.9), rnd(-0.85,0.85), 0],
+        scale:rnd(0.12,0.25),
+        direction:Math.random()<0.5?-1:1,
+        speed:rnd(0.006,0.012),
+        angle:rnd(-0.12,0.12)
+      }));
+    }
+  }
+  resetScene();
+
+  // controls
+  let paused=false, wireframe=false;
+  const keys = new Set();
+  addEventListener('keydown', e=>{
+    keys.add(e.key);
+    if ([' ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) e.preventDefault();
+    if (e.key.toLowerCase()==='f') wireframe = !wireframe;
+    if (e.key.toLowerCase()==='r') resetScene();
+    if (e.key===' ') paused = !paused;
+  });
+  addEventListener('keyup', e=> keys.delete(e.key));
+
+  canvas.addEventListener('pointerdown', e=>{
+    const r = canvas.getBoundingClientRect();
+    const x = ((e.clientX-r.left)/r.width)*2 - 1;
+    const y = -(((e.clientY-r.top)/r.height)*2 - 1);
+    fish.push(createFish({ offset:[x,y,0], scale:rnd(0.12,0.22), direction:Math.random()<0.5?-1:1, speed:rnd(0.006,0.014) }));
+  });
+
+  // ---- MUSIC (file-first, WebAudio fallback) ----
+  const musicBtn = document.getElementById('musicBtn');
+  let playing = false;
+  let htmlAudio = null;
+  let audioCtx = null, noiseNode = null, gainNode = null, lfo = null;
+
+  async function startAudioHtml() {
+    try {
+      if (!htmlAudio) {
+        htmlAudio = new Audio('ocean.mp3');  // place this file next to index.html
+        htmlAudio.loop = true;
+        htmlAudio.volume = 0.45;
+      }
+      await htmlAudio.play();                 // requires user gesture
+      playing = true;
+      musicBtn.textContent = '⏸ Pause';
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function startAudioWeb() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    const N = 2 * audioCtx.sampleRate;
+    const buf = audioCtx.createBuffer(1, N, audioCtx.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < N; i++) ch[i] = (Math.random() * 2 - 1) * 0.3;
+
+    noiseNode = audioCtx.createBufferSource();
+    noiseNode.buffer = buf;
+    noiseNode.loop = true;
+
+    const lowpass = audioCtx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 420;
+
+    gainNode = audioCtx.createGain();
+    gainNode.gain.value = 0.25;
+
+    lfo = audioCtx.createOscillator();
+    const lfoGain = audioCtx.createGain();
+    lfo.frequency.value = 0.10;
+    lfoGain.gain.value = 0.15;
+    lfo.connect(lfoGain).connect(gainNode.gain);
+
+    noiseNode.connect(lowpass).connect(gainNode).connect(audioCtx.destination);
+    noiseNode.start();
+    lfo.start();
+
+    playing = true;
+    musicBtn.textContent = '⏸ Pause';
+  }
+
+  function pauseAudio() {
+    if (htmlAudio && !htmlAudio.paused) htmlAudio.pause();
+    if (audioCtx && audioCtx.state === 'running') audioCtx.suspend();
+    playing = false;
+    musicBtn.textContent = '▶ Play Music';
+  }
+
+  musicBtn.addEventListener('click', async () => {
+    if (!playing) {
+      const ok = await startAudioHtml();
+      if (!ok) startAudioWeb();
+    } else {
+      pauseAudio();
+    }
+  });
+
+  // render
+  function draw(tms){
+    const t = tms*0.001;
+
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.vertexAttribPointer(a_position, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(a_position);
+
+    // control big fish
+    const big = fish[0];
+    if (big){
+      const accel=0.015;
+      if (keys.has('ArrowLeft'))  { big.offset[0]-=accel; big.direction=-1; }
+      if (keys.has('ArrowRight')) { big.offset[0]+=accel; big.direction=+1; }
+      if (keys.has('ArrowUp'))    { big.offset[1]+=accel; }
+      if (keys.has('ArrowDown'))  { big.offset[1]-=accel; }
+      if (keys.has('+')||keys.has('=')) big.speed=Math.min(0.03,big.speed+0.0005);
+      if (keys.has('-')||keys.has('_')) big.speed=Math.max(0.002,big.speed-0.0005);
+      if (keys.has('a')||keys.has('A')) big.angle-=0.03;
+      if (keys.has('d')||keys.has('D')) big.angle+=0.03;
+      big.offset[0]=Math.max(-1.05,Math.min(1.05,big.offset[0]));
+      big.offset[1]=Math.max(-1.00,Math.min(1.00,big.offset[1]));
+    }
+
+    if (!paused){
+      for (let i=0;i<fish.length;i++){
+        const f = fish[i];
+        if (i!==0){ f.offset[1]+=Math.sin(t*2.0+i)*0.002; f.angle+=Math.sin(t*1.2+i*0.35)*0.001; }
+        f.offset[0]+= f.speed * (f.direction===-1?-1:1);
+        const X=1.06;
+        if (f.offset[0]> X) f.direction=-1;
+        if (f.offset[0]<-X) f.direction=+1;
+        f.offset[1]=Math.max(-0.98,Math.min(0.98,f.offset[1]));
+      }
+    }
+
+    for (let i=0;i<fish.length;i++){
+      const f = fish[i];
+
+      // small-fish alpha: base + slow pulse + quick shimmer (flicker)
+      let rgba = f.color;
+      if (i !== 0) {
+        const baseA   = f.color[3];
+        const pulse   = 0.15 * Math.sin(t * 2.0 + i * 0.13);  // breathing
+        const flicker = 0.12 * Math.abs(Math.sin(t * 18.0 + f.seed)); // smooth shimmer
+        const a = Math.max(0.35, Math.min(1.0, baseA + pulse + flicker));
+        rgba = new Float32Array([f.color[0], f.color[1], f.color[2], a]);
+      }
+      gl.uniform4fv(u_color, rgba);
+
+      const sx = f.scale * (f.direction===-1 ? -1 : 1);
+      const M = TRS(f.offset[0], f.offset[1], sx, f.scale, f.angle);
+      gl.uniformMatrix4fv(u_transform, false, M);
+
+      // body
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+      gl.drawElements(gl.TRIANGLES, 15, gl.UNSIGNED_BYTE, 0);
+
+      // wireframe (toggle with F)
+      if (wireframe){
+        gl.uniform4fv(u_color, new Float32Array([0,0,0,0.35]));
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+        gl.lineWidth(1);
+        gl.drawElements(gl.LINES, edges.length, gl.UNSIGNED_BYTE, 0);
+      }
+
+      // eye
+      gl.uniform4fv(u_color, new Float32Array([0,0,0,0.85]));
+      gl.uniform1f(u_pointsize, Math.max(10.0, f.scale*22.0));
+      gl.bindBuffer(gl.ARRAY_BUFFER, f.eyeVBO);
+      gl.vertexAttribPointer(a_position, 3, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(a_position);
+      gl.drawArrays(gl.POINTS, 0, 1);
+
+      // restore VBO
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      gl.vertexAttribPointer(a_position, 3, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(a_position);
+    }
+
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
